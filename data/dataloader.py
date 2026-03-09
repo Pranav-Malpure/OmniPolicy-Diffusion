@@ -83,20 +83,30 @@ class ActionChunkDataset(Dataset):
             self._mean: Optional[torch.Tensor] = None
             self._std:  Optional[torch.Tensor] = None
 
-        # Keep files open for fast repeated access
-        self._h5_handles: list[h5py.File] = [
-            h5py.File(path, 'r') for path, _ in self._files
-        ]
+        # Handles are opened lazily per-worker to avoid sharing file descriptors
+        # across forked DataLoader workers (unsafe with h5py).
+        self._h5_handles: list[h5py.File | None] = [None] * len(self._files)
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
         return len(self._index)
 
+    def _get_handle(self, file_idx: int) -> h5py.File:
+        """Return (and lazily open) the H5 handle for file_idx.
+
+        Opening on first access means each forked DataLoader worker gets its
+        own file descriptor rather than sharing one inherited from the parent.
+        """
+        if self._h5_handles[file_idx] is None:
+            path = self._files[file_idx][0]
+            self._h5_handles[file_idx] = h5py.File(path, 'r')
+        return self._h5_handles[file_idx]  # type: ignore[return-value]
+
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         file_idx, ep_key, start, actual_len = self._index[idx]
         robot_id = self._files[file_idx][1]
 
-        ep_grp = self._h5_handles[file_idx][ep_key]
+        ep_grp = self._get_handle(file_idx)[ep_key]
         assert isinstance(ep_grp, h5py.Group)
         ds = ep_grp['actions']
         assert isinstance(ds, h5py.Dataset)
@@ -152,10 +162,11 @@ class ActionChunkDataset(Dataset):
 
     def __del__(self):
         for h in getattr(self, '_h5_handles', []):
-            try:
-                h.close()
-            except Exception:
-                pass
+            if h is not None:
+                try:
+                    h.close()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +266,7 @@ class DiTDataset(ActionChunkDataset):
             return chunk, robot_id, obs
 
         file_idx, ep_key, start, _ = self._index[idx]
-        ep_grp = self._h5_handles[file_idx][ep_key]
+        ep_grp = self._get_handle(file_idx)[ep_key]
         assert isinstance(ep_grp, h5py.Group)
 
         if self.obs_mode == "state":

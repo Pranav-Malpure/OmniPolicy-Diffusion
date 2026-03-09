@@ -25,6 +25,7 @@ import argparse
 import os
 import json
 import time
+from datetime import datetime
 from typing import Optional
 
 import torch
@@ -84,7 +85,7 @@ def parse_args():
     p.add_argument("--num-workers", type=int,   default=4)
 
     # Checkpointing
-    p.add_argument("--ckpt-dir",   type=str, default="checkpoints/dit")
+    p.add_argument("--ckpt-dir",   type=str, default="/pers_vol/checkpoints/dit")
     p.add_argument("--save-every", type=int, default=10)
 
     # Misc
@@ -203,9 +204,13 @@ def main():
     if args.panda_h5 is None and args.xarm6_h5 is None:
         raise ValueError("Provide at least one of --panda-h5 or --xarm6-h5")
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.ckpt_dir = f"{args.ckpt_dir}_{args.obs_mode}_{timestamp}"
+
     device = get_device(args.device)
     print(f"Device  : {device}")
     print(f"Obs mode: {args.obs_mode}")
+    print(f"Ckpt dir: {args.ckpt_dir}")
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
