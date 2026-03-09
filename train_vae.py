@@ -18,6 +18,7 @@ import argparse
 import os
 import json
 import time
+from datetime import datetime
 
 import torch
 import torch.optim as optim
@@ -39,7 +40,7 @@ def parse_args():
     p.add_argument("--panda-h5",  type=str, default=None, help="Path to Panda h5 file")
     p.add_argument("--xarm6-h5",  type=str, default=None, help="Path to xArm6 h5 file")
     p.add_argument("--k-steps",   type=int, default=16,   help="Action chunk length")
-    p.add_argument("--stride",    type=int, default=8,    help="Sliding window stride")
+    p.add_argument("--stride",    type=int, default=1,    help="Sliding window stride")
 
     # Model
     p.add_argument("--latent-dim",  type=int,   default=64,   help="VAE latent dimension")
@@ -58,7 +59,7 @@ def parse_args():
                    help="Epochs over which beta ramps from 0 to beta-max")
 
     # Checkpointing
-    p.add_argument("--ckpt-dir",  type=str, default="checkpoints/vae",
+    p.add_argument("--ckpt-dir",  type=str, default="/pers_vol/checkpoints/vae",
                    help="Directory to save checkpoints and normalisation stats")
     p.add_argument("--save-every", type=int, default=10, help="Save checkpoint every N epochs")
 
@@ -135,8 +136,13 @@ def main():
     if args.panda_h5 is None and args.xarm6_h5 is None:
         raise ValueError("Provide at least one of --panda-h5 or --xarm6-h5")
 
+    # Append timestamp so every run gets its own directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.ckpt_dir = f"{args.ckpt_dir}_{timestamp}"
+
     device = get_device(args.device)
     print(f"Device: {device}")
+    print(f"Checkpoint dir: {args.ckpt_dir}")
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
 

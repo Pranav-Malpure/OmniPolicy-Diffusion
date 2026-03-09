@@ -1,9 +1,14 @@
 """
-ActionChunkDataset: loads 7-DOF delta end-effector actions from ManiSkill h5 files,
-chunks them into fixed-length windows of size K, and labels each chunk with a robot ID.
+ActionChunkDataset / DiTDataset: load 7-DOF delta end-effector actions from ManiSkill
+h5 files, chunk into fixed-length windows, and optionally return observations.
 
-Both Panda and xArm6 use pd_ee_delta_pose -> actions are always (T, 7), robot-agnostic.
-The robot_id label (int) is what allows the downstream DiT to condition on embodiment.
+ActionChunkDataset  — used by VAE training (returns chunk, robot_id)
+DiTDataset          — used by DiT training (returns chunk, robot_id, obs)
+
+obs_mode options for DiTDataset:
+  "none"  — no visual context; obs is a 1-D zero placeholder
+  "state" — proprioceptive state vector, zero-padded to MAX_STATE_DIM
+  "rgb"   — RGB image (3, H, W) normalised to [0, 1]
 """
 
 import h5py
@@ -13,8 +18,13 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional
 
 
-# Robot ID registry 
-ROBOT_IDS = {"panda": 0, "xarm6": 1}
+# Robot ID registry — extend as needed
+ROBOT_IDS = {"panda": 0, "xarm6": 1, "xarm7": 2}
+
+# Largest proprioceptive state dim across all supported robots; smaller states are zero-padded
+MAX_STATE_DIM = 64
+
+OBS_MODES = ("none", "state", "rgb")
 
 
 class ActionChunkDataset(Dataset):
@@ -34,14 +44,15 @@ class ActionChunkDataset(Dataset):
     def __init__(self,
                  h5_paths: list[tuple[str, str]],
                  k_steps: int = 16,
-                 stride: int = 8,
+                 stride: int = 1,
                  normalize: bool = True):
         self.k_steps   = k_steps
         self.stride    = stride
         self.normalize = normalize
 
-        # index: list of (file_idx, episode_key, start_t)
-        self._index: list[tuple[int, str, int]] = []
+        # index: list of (file_idx, episode_key, start_t, actual_len)
+        # actual_len == k_steps for full windows; < k_steps for the padded tail chunk
+        self._index: list[tuple[int, str, int, int]] = []
         self._files: list[tuple[str, int]] = []   # (path, robot_id) per file_idx
 
         for path, robot_name in h5_paths:
@@ -57,8 +68,9 @@ class ActionChunkDataset(Dataset):
                     ds = ep_grp['actions']
                     assert isinstance(ds, h5py.Dataset)
                     T = ds.shape[0]   # number of action steps
-                    for start in range(0, T - k_steps + 1, stride):
-                        self._index.append((file_idx, ep_key, start))
+                    for start in range(0, T, stride):
+                        actual_len = min(k_steps, T - start)
+                        self._index.append((file_idx, ep_key, start, actual_len))
 
         print(f"[ActionChunkDataset] {len(self._index):,} chunks from {len(self._files)} file(s)")
         for path, rid in self._files:
@@ -81,14 +93,18 @@ class ActionChunkDataset(Dataset):
         return len(self._index)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
-        file_idx, ep_key, start = self._index[idx]
+        file_idx, ep_key, start, actual_len = self._index[idx]
         robot_id = self._files[file_idx][1]
 
         ep_grp = self._h5_handles[file_idx][ep_key]
         assert isinstance(ep_grp, h5py.Group)
         ds = ep_grp['actions']
         assert isinstance(ds, h5py.Dataset)
-        actions: np.ndarray = ds[start : start + self.k_steps]   # (K, 7)
+        actions: np.ndarray = ds[start : start + actual_len]   # (actual_len, 7)
+
+        if actual_len < self.k_steps:
+            pad = np.repeat(actions[-1:], self.k_steps - actual_len, axis=0)
+            actions = np.concatenate([actions, pad], axis=0)  # (K, 7)
 
         chunk = torch.from_numpy(actions.astype(np.float32))  # (K, 7)
 
@@ -109,14 +125,17 @@ class ActionChunkDataset(Dataset):
 
         all_actions = []
         for idx in chosen:
-            file_idx, ep_key, start = self._index[idx]
+            file_idx, ep_key, start, actual_len = self._index[idx]
             path = self._files[file_idx][0]
             with h5py.File(path, 'r') as f:
                 ep_grp = f[ep_key]
                 assert isinstance(ep_grp, h5py.Group)
                 ds = ep_grp['actions']
                 assert isinstance(ds, h5py.Dataset)
-                a: np.ndarray = ds[start : start + self.k_steps]
+                a: np.ndarray = ds[start : start + actual_len]
+                if actual_len < self.k_steps:
+                    pad = np.repeat(a[-1:], self.k_steps - actual_len, axis=0)
+                    a = np.concatenate([a, pad], axis=0)
                 all_actions.append(a.astype(np.float32))
 
         all_actions = np.stack(all_actions)  # (n, K, 7)
@@ -147,7 +166,7 @@ def make_dataloaders(
     panda_h5: Optional[str],
     xarm6_h5: Optional[str],
     k_steps:   int   = 16,
-    stride:    int   = 8,
+    stride:    int   = 1,
     batch_size: int  = 256,
     val_split:  float = 0.05,
     num_workers: int  = 4,
@@ -193,6 +212,141 @@ def make_dataloaders(
     )
 
     print(f"[make_dataloaders] train={n_train:,}  val={n_val:,}  batch={batch_size}")
+    return train_loader, val_loader, dataset
+
+
+# ---------------------------------------------------------------------------
+# DiTDataset — extends ActionChunkDataset with observation support
+# ---------------------------------------------------------------------------
+
+class DiTDataset(ActionChunkDataset):
+    """
+    Same sliding-window action chunks as ActionChunkDataset, but also returns
+    an observation tensor at the start of each chunk for DiT conditioning.
+
+    Returns:
+        chunk    : (action_dim, K)  normalised action chunk
+        robot_id : int
+        obs      : tensor whose shape depends on obs_mode:
+                     "none"  → (1,)           zero placeholder
+                     "state" → (MAX_STATE_DIM,) zero-padded proprioceptive state
+                     "rgb"   → (3, H, W)       float32 in [0, 1]
+    """
+
+    def __init__(
+        self,
+        h5_paths:  list[tuple[str, str]],
+        k_steps:   int  = 16,
+        stride:    int  = 8,
+        normalize: bool = True,
+        obs_mode:  str  = "none",
+    ):
+        assert obs_mode in OBS_MODES, f"obs_mode must be one of {OBS_MODES}"
+        super().__init__(h5_paths, k_steps=k_steps, stride=stride, normalize=normalize)
+        self.obs_mode = obs_mode
+
+    # ------------------------------------------------------------------
+    # Override return type via overload to avoid basedpyright incompatibility
+    def __getitem__(self, idx: int):  # type: ignore[override]
+        chunk, robot_id = super().__getitem__(idx)
+
+        if self.obs_mode == "none":
+            obs = torch.zeros(1)
+            return chunk, robot_id, obs
+
+        file_idx, ep_key, start, _ = self._index[idx]
+        ep_grp = self._h5_handles[file_idx][ep_key]
+        assert isinstance(ep_grp, h5py.Group)
+
+        if self.obs_mode == "state":
+            obs_grp = ep_grp['obs']
+            assert isinstance(obs_grp, h5py.Group)
+            ds = obs_grp['state']
+            assert isinstance(ds, h5py.Dataset)
+            state: np.ndarray = ds[start]          # (state_dim,)
+            obs_np = state.astype(np.float32)
+            # Zero-pad to MAX_STATE_DIM so batches from different robots collate
+            if obs_np.shape[0] < MAX_STATE_DIM:
+                obs_np = np.pad(obs_np, (0, MAX_STATE_DIM - obs_np.shape[0]))
+            else:
+                obs_np = obs_np[:MAX_STATE_DIM]
+            obs = torch.from_numpy(obs_np)         # (MAX_STATE_DIM,)
+
+        else:  # "rgb"
+            obs_grp = ep_grp['obs']
+            assert isinstance(obs_grp, h5py.Group)
+            sensor_grp = obs_grp['sensor_data']
+            assert isinstance(sensor_grp, h5py.Group)
+            cam_grp = sensor_grp['base_camera']
+            assert isinstance(cam_grp, h5py.Group)
+            ds = cam_grp['rgb']
+            assert isinstance(ds, h5py.Dataset)
+            rgb: np.ndarray = ds[start]            # (H, W, 3) uint8
+            # (H, W, 3) → (3, H, W), float [0, 1]
+            obs = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+        return chunk, robot_id, obs
+
+
+# ---------------------------------------------------------------------------
+# DiT factory helper
+# ---------------------------------------------------------------------------
+
+def make_dit_dataloaders(
+    panda_h5:    Optional[str],
+    xarm6_h5:    Optional[str],
+    obs_mode:    str   = "none",
+    k_steps:     int   = 16,
+    stride:      int   = 8,
+    batch_size:  int   = 256,
+    val_split:   float = 0.05,
+    num_workers: int   = 4,
+    normalize:   bool  = True,
+    seed:        int   = 42,
+) -> tuple[DataLoader, DataLoader, DiTDataset]:
+    """
+    Returns (train_loader, val_loader, dataset) for DiT training.
+    obs_mode controls what observation tensor is returned alongside each chunk.
+    """
+    h5_paths = []
+    if panda_h5:
+        h5_paths.append((panda_h5, "panda"))
+    if xarm6_h5:
+        h5_paths.append((xarm6_h5, "xarm6"))
+
+    dataset = DiTDataset(
+        h5_paths,
+        k_steps=k_steps,
+        stride=stride,
+        normalize=normalize,
+        obs_mode=obs_mode,
+    )
+
+    n_val   = int(len(dataset) * val_split)
+    n_train = len(dataset) - n_val
+    train_ds, val_ds = torch.utils.data.random_split(
+        dataset,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    print(f"[make_dit_dataloaders] obs_mode={obs_mode}  train={n_train:,}  val={n_val:,}  batch={batch_size}")
     return train_loader, val_loader, dataset
 
 
