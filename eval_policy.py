@@ -100,11 +100,11 @@ def parse_args():
     p.add_argument("--n-episodes", type=int, default=50,
                    help="Episodes per robot")
     p.add_argument("--max-steps",  type=int, default=100,
-                   help="Max env steps per episode")
+                   help="Max env steps per episode (also overrides env max_episode_steps)")
 
     # Recording
-    p.add_argument("--video-dir", type=str, default="eval_videos",
-                   help="Directory to save video files")
+    p.add_argument("--video-dir", type=str, default="/tmp/eval_videos",
+                   help="Directory to save video files (uploaded to W&B; tmp is fine)")
     p.add_argument("--no-video",  action="store_true",
                    help="Disable video recording")
 
@@ -197,21 +197,25 @@ def make_env(robot_name: str, obs_mode: str, output_dir: str,
 
     raw_env = gym.make(
         "PickCube-v1",
-        num_envs        = 1,
-        obs_mode        = gym_obs,
-        control_mode    = "pd_ee_delta_pose",
-        render_mode     = "rgb_array",
-        robot_uids      = cfg["robot_uids"],
-        sim_backend     = "gpu" if torch.cuda.is_available() else "cpu",
-        reconfiguration_freq = 1,   # re-randomise cube position every reset
+        num_envs             = 1,
+        obs_mode             = gym_obs,
+        control_mode         = "pd_ee_delta_pose",
+        render_mode          = "rgb_array",
+        robot_uids           = cfg["robot_uids"],
+        sim_backend          = "gpu" if torch.cuda.is_available() else "cpu",
+        reconfiguration_freq = 1,      # re-randomise cube position every reset
+        max_episode_steps    = max_steps,  # override env default (50) to match eval budget
     )
 
-    raw_env = FlattenRGBDObservationWrapper(
-        raw_env,
-        rgb   = (obs_mode == "rgb"),
-        depth = False,
-        state = True,
-    )
+    # FlattenRGBDObservationWrapper requires sensor_data (cameras) in the obs,
+    # which only exists when gym_obs includes RGB. Skip it for obs_mode="none".
+    if obs_mode != "none":
+        raw_env = FlattenRGBDObservationWrapper(
+            raw_env,
+            rgb   = (obs_mode == "rgb"),
+            depth = False,
+            state = True,
+        )
 
     if record:
         os.makedirs(output_dir, exist_ok=True)
@@ -350,6 +354,11 @@ def main():
             tags     = ["eval", f"obs-{args.obs_mode}"] + args.robots,
             save_code= True,
         )
+        wandb.config.update({"max_episode_steps": args.max_steps}, allow_val_change=True)
+        # Use episode/num as custom x-axis so RecordEpisode's video uploads
+        # (which advance W&B's global step) don't conflict with our logs.
+        wandb.define_metric("episode/num")
+        wandb.define_metric("episode/*", step_metric="episode/num")
 
     # -----------------------------------------------------------------------
     # Load models
@@ -372,6 +381,10 @@ def main():
     # Evaluate per robot
     # -----------------------------------------------------------------------
     all_results: dict[str, dict] = {}   # robot → {model_tag → metrics}
+
+    # Global episode counter so panda (1-50) and xarm6 (51-100) form one
+    # continuous x-axis across all three eval runs (none / state / rgb).
+    global_ep = [0]
 
     def evaluate_model(tag: str, d: DiffusionTransformer, oe: Optional[torch.nn.Module]):
         for robot_name in args.robots:
@@ -411,10 +424,23 @@ def main():
                 returns.append(result["total_reward"])
                 latencies.append(result["mean_plan_ms"])
 
+                global_ep[0] += 1
+
                 status = "✓" if result["success"] else "✗"
                 print(f"  ep {ep+1:3d}/{args.n_episodes}  {status}  "
                       f"return={result['total_reward']:.2f}  "
                       f"plan={result['mean_plan_ms']:.1f}ms")
+
+                # Per-episode log — episode/num is the x-axis (panda=1-50, xarm6=51-100).
+                # Using a custom metric avoids conflicts with RecordEpisode's video uploads.
+                if use_wandb:
+                    wandb.log({
+                        "episode/num":      global_ep[0],
+                        "episode/return":   result["total_reward"],
+                        "episode/success":  int(result["success"]),
+                        "episode/plan_ms":  result["mean_plan_ms"],
+                        "episode/robot":    robot_name,
+                    })
 
             sr      = float(np.mean(successes))
             ret     = float(np.mean(returns))
@@ -425,12 +451,13 @@ def main():
             key = f"{tag}/{robot_name}"
             all_results[key] = {"sr": sr, "return": ret, "latency_ms": lat_ms}
 
+            # Aggregate metrics per robot
             if use_wandb:
                 wandb.log({
-                    f"{key}/success_rate":    sr,
-                    f"{key}/mean_return":     ret,
-                    f"{key}/latency_ms":      lat_ms,
-                    f"{key}/ddim_steps":      args.ddim_steps,
+                    f"{key}/success_rate": sr,
+                    f"{key}/mean_return":  ret,
+                    f"{key}/latency_ms":   lat_ms,
+                    f"{key}/max_episode_steps": args.max_steps,
                 })
 
             env.close()
